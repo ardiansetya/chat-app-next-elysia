@@ -16,7 +16,7 @@ import {
   useMessageScrollerScrollable,
 } from "@/components/ui/message-scroller";
 import { Spinner } from "@/components/ui/spinner";
-import type { Message as MessageData } from "@/lib/mock-api";
+import type { Message as MessageData } from "@/lib/types";
 import { hhmm, initials } from "@/lib/utils";
 
 export type ChatMessage = MessageData & { status?: "sending" | "failed" };

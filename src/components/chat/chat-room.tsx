@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowLeftIcon, CopyIcon, EllipsisVerticalIcon, UserMinusIcon, UserPlusIcon, UsersIcon, WifiOffIcon } from "lucide-react";
 import { MessageInput } from "@/components/chat/message-input";
 import { MessageList, type ChatMessage } from "@/components/chat/message-list";
@@ -23,62 +23,98 @@ import { MessageScrollerProvider, useMessageScroller } from "@/components/ui/mes
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/toast";
-import {
-  createInvite,
-  getMembers,
-  getMessages,
-  getRoom,
-  me,
-  removeMember,
-  sendMessage,
-  type Member,
-  type Role,
-  type Room,
-} from "@/lib/mock-api";
+import { api, errorMessage } from "@/lib/api";
+import { authClient } from "@/lib/auth-client";
+import { cursorOf, type Member, type Message, type Role, type Room } from "@/lib/types";
 import { initials } from "@/lib/utils";
 
-// shortcut: status online browser sebagai pengganti error EventSource; Fase 4 ganti dengan onerror/onopen SSE.
-const subscribeOnline = (cb: () => void) => {
-  addEventListener("online", cb);
-  addEventListener("offline", cb);
-  return () => {
-    removeEventListener("online", cb);
-    removeEventListener("offline", cb);
-  };
-};
+type RoomDetail = Room & { role: Role };
+
+// Room kosong: stream tetap diberi cursor supaya pesan yang masuk sebelum stream tersambung ikut terkirim.
+const EPOCH_CURSOR = `${new Date(0).toISOString()}_00000000-0000-0000-0000-000000000000`;
+
+const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+const byCursor = (a: Message, b: Message) => cmp(a.createdAt, b.createdAt) || cmp(a.id, b.id);
+
+/** Gabungkan pesan dari SSE: abaikan duplikat (id sama), gantikan versi "mengirim" milik sendiri. */
+export function mergeIncoming(prev: ChatMessage[], m: Message): ChatMessage[] {
+  if (prev.some((x) => x.id === m.id)) return prev;
+  const temp = prev.findIndex((x) => x.status === "sending" && x.userId === m.userId && x.content === m.content);
+  const rest = temp >= 0 ? prev.filter((_, i) => i !== temp) : prev;
+  return [...rest, m].sort(byCursor);
+}
 
 export function ChatRoom({ roomId }: { roomId: string }) {
-  const [room, setRoom] = useState<(Room & { role: Role }) | null | undefined>(undefined);
+  const me = authClient.useSession().data?.user;
+  const [room, setRoom] = useState<RoomDetail | null | undefined>(undefined);
   const [members, setMembers] = useState<Member[]>([]);
   const [messages, setMessages] = useState<ChatMessage[] | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [streamFrom, setStreamFrom] = useState<string | null>(null);
+  const [streamKey, setStreamKey] = useState(0);
+  const [reconnecting, setReconnecting] = useState(false);
+
+  const memberIds = useRef(new Set<string>());
+  const loadMembers = useCallback(async () => {
+    const { data } = await api.rooms({ id: roomId }).members.get();
+    if (!data) return;
+    memberIds.current = new Set(data.map((m) => m.userId));
+    setMembers(data);
+  }, [roomId]);
 
   useEffect(() => {
-    getRoom(roomId).then((r) => {
-      setRoom(r);
-      if (!r) return;
-      getMembers(roomId).then(setMembers);
-      getMessages(roomId, null).then(({ items, nextCursor }) => {
-        setMessages(items.reverse());
-        setCursor(nextCursor);
+    const r = api.rooms({ id: roomId });
+    r.get().then(({ data }) => {
+      setRoom(data ?? null);
+      if (!data) return;
+      loadMembers();
+      r.messages.get().then(({ data, error }) => {
+        if (!data) return void toast.add({ title: errorMessage(error, "Gagal memuat pesan"), type: "error" });
+        setMessages([...data.items].reverse());
+        setCursor(data.nextCursor);
+        setStreamFrom(data.items[0] ? cursorOf(data.items[0]) : EPOCH_CURSOR);
       });
     });
-  }, [roomId]);
+  }, [roomId, loadMembers]);
+
+  // Real-time: EventSource reconnect sendiri dengan header Last-Event-ID; server mengirim pesan yang terlewat.
+  useEffect(() => {
+    if (!streamFrom) return;
+    const es = new EventSource(`/api/rooms/${roomId}/stream?after=${encodeURIComponent(streamFrom)}`);
+    es.onopen = () => setReconnecting(false);
+    es.onerror = () => {
+      setReconnecting(true);
+      if (es.readyState !== EventSource.CLOSED) return;
+      // Ditutup permanen (respons bukan 200), mis. 403 setelah dikeluarkan dari room.
+      api.rooms({ id: roomId }).get().then(({ error }) => {
+        if (error?.status === 403) setRoom(null);
+        else setTimeout(() => setStreamKey((k) => k + 1), 3000);
+      });
+    };
+    es.addEventListener("message", (e) => {
+      const m = JSON.parse(e.data) as Message;
+      setMessages((prev) => prev && mergeIncoming(prev, m));
+      // Pengirim belum dikenal = anggota baru bergabung; segarkan jumlah & daftar anggota.
+      if (!memberIds.current.has(m.userId)) loadMembers();
+    });
+    return () => es.close();
+  }, [roomId, streamFrom, streamKey, loadMembers]);
 
   const loadOlder = useCallback(async () => {
     if (!cursor) return;
     setLoadingOlder(true);
-    const { items, nextCursor } = await getMessages(roomId, cursor);
+    const { data, error } = await api.rooms({ id: roomId }).messages.get({ query: { cursor } });
+    setLoadingOlder(false);
+    if (!data) return void toast.add({ title: errorMessage(error, "Gagal memuat pesan lama"), type: "error" });
     setMessages((prev) => {
       const seen = new Set(prev?.map((m) => m.id));
-      return [...items.reverse().filter((m) => !seen.has(m.id)), ...(prev ?? [])];
+      return [...[...data.items].reverse().filter((m) => !seen.has(m.id)), ...(prev ?? [])];
     });
-    setCursor(nextCursor);
-    setLoadingOlder(false);
+    setCursor(data.nextCursor);
   }, [roomId, cursor]);
 
-  if (room === undefined) return <ChatSkeleton />;
+  if (room === undefined || !me) return <ChatSkeleton />;
   if (room === null)
     return (
       <Empty className="flex-1">
@@ -94,17 +130,55 @@ export function ChatRoom({ roomId }: { roomId: string }) {
       </Empty>
     );
 
+  async function send(content: string, retryId?: string) {
+    if (!me) return;
+    const tempId = retryId ?? crypto.randomUUID();
+    const temp: ChatMessage = {
+      id: tempId,
+      roomId,
+      userId: me.id,
+      userName: me.name,
+      content,
+      createdAt: new Date().toISOString(),
+      status: "sending",
+    };
+    setMessages((prev) => (retryId ? (prev ?? []).map((m) => (m.id === retryId ? temp : m)) : [...(prev ?? []), temp]));
+
+    const res = await api.rooms({ id: roomId }).messages.post({ content }).catch(() => null);
+    const saved = res?.data;
+    if (saved) {
+      // Kalau SSE sudah lebih dulu mengantar pesan ini, cukup buang versi sementaranya.
+      setMessages((prev) =>
+        prev && (prev.some((m) => m.id === saved.id) ? prev.filter((m) => m.id !== tempId) : prev.map((m) => (m.id === tempId ? saved : m))),
+      );
+      return;
+    }
+    setMessages((prev) => prev && prev.map((m) => (m.id === tempId ? { ...m, status: "failed" } : m)));
+    toast.add({
+      title: res?.error?.status === 429 ? "Terlalu cepat, tunggu sebentar" : errorMessage(res?.error, "Pesan gagal dikirim"),
+      type: "error",
+    });
+  }
+
   return (
     <MessageScrollerProvider autoScroll>
       <ChatHeader
         room={room}
         members={members}
+        myId={me.id}
+        onOpenMembers={loadMembers}
         onRemove={async (userId) => {
-          await removeMember(room.id, userId);
-          setMembers(await getMembers(room.id));
+          const { error } = await api.rooms({ id: room.id }).members({ userId }).delete();
+          if (error) toast.add({ title: errorMessage(error, "Gagal mengeluarkan anggota"), type: "error" });
+          await loadMembers();
         }}
       />
-      <ReconnectBanner />
+      {reconnecting && (
+        <Alert variant="warning" className="rounded-none border-x-0 border-t-0">
+          <WifiOffIcon />
+          <AlertTitle>Menyambungkan kembali…</AlertTitle>
+        </Alert>
+      )}
       {messages === null ? (
         <MessagesSkeleton />
       ) : (
@@ -120,28 +194,6 @@ export function ChatRoom({ roomId }: { roomId: string }) {
       <Composer onSend={(content) => send(content)} />
     </MessageScrollerProvider>
   );
-
-  async function send(content: string, retryId?: string) {
-    const tempId = retryId ?? crypto.randomUUID();
-    const temp: ChatMessage = {
-      id: tempId,
-      roomId,
-      userId: me.id,
-      userName: me.name,
-      content,
-      createdAt: new Date().toISOString(),
-      status: "sending",
-    };
-    setMessages((prev) => (retryId ? (prev ?? []).map((m) => (m.id === retryId ? temp : m)) : [...(prev ?? []), temp]));
-    try {
-      const saved = await sendMessage(roomId, content);
-      setMessages((prev) => (prev ?? []).map((m) => (m.id === tempId ? saved : m)));
-    } catch {
-      setMessages((prev) => (prev ?? []).map((m) => (m.id === tempId ? { ...m, status: "failed" } : m)));
-      // Fase 5: bedakan 429 -> "Terlalu cepat, tunggu sebentar".
-      toast.add({ title: "Pesan gagal dikirim", type: "error" });
-    }
-  }
 }
 
 /** Input di dalam provider supaya bisa melompat ke pesan terbaru setelah mengirim. */
@@ -157,24 +209,17 @@ function Composer({ onSend }: { onSend: (content: string) => void }) {
   );
 }
 
-function ReconnectBanner() {
-  const online = useSyncExternalStore(subscribeOnline, () => navigator.onLine, () => true);
-  if (online) return null;
-  return (
-    <Alert variant="warning" className="rounded-none border-x-0 border-t-0">
-      <WifiOffIcon />
-      <AlertTitle>Menyambungkan kembali…</AlertTitle>
-    </Alert>
-  );
-}
-
 function ChatHeader({
   room,
   members,
+  myId,
+  onOpenMembers,
   onRemove,
 }: {
-  room: Room & { role: Role };
+  room: RoomDetail;
   members: Member[];
+  myId: string;
+  onOpenMembers: () => void;
   onRemove: (userId: string) => Promise<void>;
 }) {
   const [open, setOpen] = useState<"members" | "invite" | null>(null);
@@ -205,7 +250,12 @@ function ChatHeader({
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
           <DropdownMenuGroup>
-            <DropdownMenuItem onClick={() => setOpen("members")}>
+            <DropdownMenuItem
+              onClick={() => {
+                setOpen("members");
+                onOpenMembers();
+              }}
+            >
               <UsersIcon />
               Anggota
             </DropdownMenuItem>
@@ -233,7 +283,7 @@ function ChatHeader({
                 </Avatar>
                 <span className="flex-1 truncate text-sm">
                   {m.name}
-                  {m.userId === me.id && " (kamu)"}
+                  {m.userId === myId && " (kamu)"}
                 </span>
                 {m.role === "owner" && <Badge variant="secondary">Pemilik</Badge>}
                 {isOwner && m.role !== "owner" && (
@@ -247,26 +297,12 @@ function ChatHeader({
         </SheetContent>
       </Sheet>
 
-      <InviteDialog roomId={room.id} open={open === "invite"} onOpenChange={(o) => setOpen(o ? "invite" : null)} />
+      <Dialog open={open === "invite"} onOpenChange={(o) => setOpen(o ? "invite" : null)}>
+        <DialogContent>
+          <InviteLink roomId={room.id} />
+        </DialogContent>
+      </Dialog>
     </header>
-  );
-}
-
-function InviteDialog({
-  roomId,
-  open,
-  onOpenChange,
-}: {
-  roomId: string;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-}) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <InviteLink roomId={roomId} />
-      </DialogContent>
-    </Dialog>
   );
 }
 
@@ -275,37 +311,40 @@ function InviteLink({ roomId }: { roomId: string }) {
   const [invite, setInvite] = useState<{ url: string; expiresAt: string } | null>(null);
 
   useEffect(() => {
-    createInvite(roomId).then(setInvite);
+    api.rooms({ id: roomId }).invites.post().then(({ data, error }) => {
+      if (data) setInvite(data);
+      else toast.add({ title: errorMessage(error, "Gagal membuat link undangan"), type: "error" });
+    });
   }, [roomId]);
 
   return (
     <>
-        <DialogHeader>
-          <DialogTitle>Undang anggota</DialogTitle>
-          <DialogDescription>
-            {invite
-              ? `Bagikan link ini. Berlaku sampai ${new Date(invite.expiresAt).toLocaleDateString("id-ID", { dateStyle: "long" })}.`
-              : "Membuat link undangan…"}
-          </DialogDescription>
-        </DialogHeader>
-        {invite ? (
-          <InputGroup>
-            <InputGroupInput readOnly value={invite.url} aria-label="Link undangan" onFocus={(e) => e.target.select()} />
-            <InputGroupAddon align="inline-end">
-              <InputGroupButton
-                onClick={async () => {
-                  await navigator.clipboard.writeText(invite.url);
-                  toast.add({ title: "Link undangan disalin", type: "success" });
-                }}
-              >
-                <CopyIcon data-icon="inline-start" />
-                Salin
-              </InputGroupButton>
-            </InputGroupAddon>
-          </InputGroup>
-        ) : (
-          <Skeleton className="h-8 w-full" />
-        )}
+      <DialogHeader>
+        <DialogTitle>Undang anggota</DialogTitle>
+        <DialogDescription>
+          {invite
+            ? `Bagikan link ini. Berlaku sampai ${new Date(invite.expiresAt).toLocaleDateString("id-ID", { dateStyle: "long" })}.`
+            : "Membuat link undangan…"}
+        </DialogDescription>
+      </DialogHeader>
+      {invite ? (
+        <InputGroup>
+          <InputGroupInput readOnly value={invite.url} aria-label="Link undangan" onFocus={(e) => e.target.select()} />
+          <InputGroupAddon align="inline-end">
+            <InputGroupButton
+              onClick={async () => {
+                await navigator.clipboard.writeText(invite.url);
+                toast.add({ title: "Link undangan disalin", type: "success" });
+              }}
+            >
+              <CopyIcon data-icon="inline-start" />
+              Salin
+            </InputGroupButton>
+          </InputGroupAddon>
+        </InputGroup>
+      ) : (
+        <Skeleton className="h-8 w-full" />
+      )}
     </>
   );
 }

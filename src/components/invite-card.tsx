@@ -8,32 +8,38 @@ import { Button } from "@/components/ui/button";
 import { Card, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
-import { acceptInvite, getInvite } from "@/lib/mock-api";
+import { toast } from "@/components/ui/toast";
+import { api, errorMessage } from "@/lib/api";
 import { initials } from "@/lib/utils";
 
 export function InviteCard({ token }: { token: string }) {
   const router = useRouter();
-  const [invite, setInvite] = useState<{ roomName: string } | null | undefined>(undefined);
+  const [invite, setInvite] = useState<{ roomName: string } | { error: string } | undefined>(undefined);
   const [pending, setPending] = useState(false);
 
   useEffect(() => {
-    getInvite(token).then(setInvite);
+    api
+      .invites({ token })
+      .get()
+      .then(({ data, error }) => setInvite(data ?? { error: errorMessage(error, "Link ini tidak berlaku.") }));
   }, [token]);
 
   async function join() {
     setPending(true);
-    const { roomId } = await acceptInvite(token);
-    router.push(`/rooms/${roomId}`);
+    const { data, error } = await api.invites({ token }).accept.post();
+    if (data) return router.push(`/rooms/${data.roomId}`);
+    setPending(false);
+    toast.add({ title: errorMessage(error, "Gagal bergabung"), type: "error" });
   }
 
   if (invite === undefined) return <Skeleton className="h-48 w-full max-w-sm rounded-xl" />;
 
-  if (invite === null)
+  if ("error" in invite)
     return (
       <Card className="w-full max-w-sm">
         <CardHeader>
           <CardTitle>Undangan tidak berlaku</CardTitle>
-          <CardDescription>Link ini salah atau sudah kedaluwarsa. Minta link baru ke pemilik room.</CardDescription>
+          <CardDescription>{invite.error} Minta link baru ke pemilik room.</CardDescription>
         </CardHeader>
         <CardFooter>
           <Button variant="outline" className="w-full" nativeButton={false} render={<Link href="/rooms" />}>

@@ -28,20 +28,36 @@ import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
-import { createRoom, getRooms, me, type RoomWithLast } from "@/lib/mock-api";
+import { toast } from "@/components/ui/toast";
+import { api, errorMessage } from "@/lib/api";
+import { authClient } from "@/lib/auth-client";
+import type { RoomWithLast } from "@/lib/types";
 import { cn, hhmm, initials } from "@/lib/utils";
+
+async function fetchRooms() {
+  const { data, error } = await api.rooms.get();
+  if (error) toast.add({ title: errorMessage(error, "Gagal memuat room"), type: "error" });
+  return data ?? [];
+}
 
 export function RoomSidebar({ className }: { className?: string }) {
   const { id: activeId } = useParams<{ id?: string }>();
   const router = useRouter();
   const [rooms, setRooms] = useState<RoomWithLast[] | null>(null);
+  const user = authClient.useSession().data?.user;
 
+  async function logout() {
+    await authClient.signOut();
+    router.push("/login");
+  }
+
+  // Muat ulang saat pindah room supaya pesan terakhir & urutan ikut segar.
   useEffect(() => {
-    getRooms().then(setRooms);
-  }, []);
+    fetchRooms().then(setRooms);
+  }, [activeId]);
 
   const onCreated = (room: { id: string }) => {
-    getRooms().then(setRooms);
+    fetchRooms().then(setRooms);
     router.push(`/rooms/${room.id}`);
   };
 
@@ -51,14 +67,14 @@ export function RoomSidebar({ className }: { className?: string }) {
         <DropdownMenu>
           <DropdownMenuTrigger render={<Button variant="ghost" className="h-auto min-w-0 gap-2 px-1.5 py-1" />}>
             <Avatar className="size-7">
-              <AvatarFallback>{initials(me.name)}</AvatarFallback>
+              <AvatarFallback>{user ? initials(user.name) : ""}</AvatarFallback>
             </Avatar>
-            <span className="truncate font-medium">{me.name}</span>
+            {user ? <span className="truncate font-medium">{user.name}</span> : <Skeleton className="h-4 w-20" />}
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start">
             <DropdownMenuGroup>
-              <DropdownMenuLabel>{me.email}</DropdownMenuLabel>
-              <DropdownMenuItem onClick={() => router.push("/login")}>
+              <DropdownMenuLabel>{user?.email}</DropdownMenuLabel>
+              <DropdownMenuItem onClick={logout}>
                 <LogOutIcon />
                 Keluar
               </DropdownMenuItem>
@@ -141,10 +157,11 @@ function NewRoomDialog({
     const name = String(new FormData(e.currentTarget).get("name")).trim();
     if (!name) return;
     setPending(true);
-    const room = await createRoom(name);
+    const { data, error } = await api.rooms.post({ name });
     setPending(false);
+    if (error) return void toast.add({ title: errorMessage(error, "Gagal membuat room"), type: "error" });
     setOpen(false);
-    onCreated(room);
+    onCreated(data);
   }
 
   return (
